@@ -29,7 +29,7 @@ public class RunService {
         CaseRow row = requireCaseById(caseId);
         return enqueue(new RunCommand(row.id(), null, "ORIGINAL", "CASE_SCORING",
                 "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
-                row.boundaryVersionId(), false, null, null, "system", "case intake scoring"));
+                row.boundaryVersionId(), false, null, null, "system", "case intake scoring", null));
     }
 
     @Transactional
@@ -38,7 +38,7 @@ public class RunService {
         return enqueue(new RunCommand(row.id(), null, "ORIGINAL", "CASE_SCORING",
                 "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
                 row.boundaryVersionId(), false, null, null, "api",
-                reason == null ? "manual case scoring request" : reason));
+                reason == null ? "manual case scoring request" : reason, null));
     }
 
     /**
@@ -50,7 +50,7 @@ public class RunService {
         CaseRow row = requireCaseById(caseId);
         return enqueue(new RunCommand(row.id(), null, "REPLAY", "REPRODUCTION",
                 "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
-                row.boundaryVersionId(), false, parentRunId, null, "replay", reason));
+                row.boundaryVersionId(), false, parentRunId, null, "replay", reason, null));
     }
 
     /**
@@ -67,7 +67,8 @@ public class RunService {
         }
         return enqueue(new RunCommand(row.id(), null, "CONTROLLED_BACKFILL", "IMPACT_ANALYSIS",
                 "LATEST_AVAILABLE", row.scoringCutoff(), availabilityCeiling, row.hazardDate(),
-                row.boundaryVersionId(), false, parentRunId, revisionEventId, "impact-analysis", reason));
+                row.boundaryVersionId(), false, parentRunId, revisionEventId, "impact-analysis",
+                reason, null));
     }
 
     /**
@@ -84,7 +85,50 @@ public class RunService {
         }
         return enqueue(new RunCommand(row.id(), null, "REPLAY", "BACKFILL_REQUEST",
                 "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
-                boundaryVersionId, true, parentRunId, null, "boundary-variant", reason));
+                boundaryVersionId, true, parentRunId, null, "boundary-variant", reason, null));
+    }
+
+    /**
+     * Queue a shadow scoring run at the case's original cutoff. Shadow runs evaluate candidate
+     * definition versions without writing a snapshot or touching the claim's production status.
+     */
+    @Transactional
+    public long queueShadowRun(long caseId, Long parentRunId, Long shadowRunId, String reason) {
+        CaseRow row = requireCaseById(caseId);
+        return enqueue(new RunCommand(row.id(), null, "SHADOW", "SHADOW_SCORING",
+                "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
+                row.boundaryVersionId(), false, parentRunId, null, "shadow-scorer", reason,
+                shadowRunId));
+    }
+
+    /** Queue one shard of a batch backfill. The shard's definition dependencies live in backfill_shard. */
+    @Transactional
+    public long queueBatchBackfillShard(long caseId, Instant availabilityCeiling, Long parentRunId,
+                                        String reason) {
+        CaseRow row = requireCaseById(caseId);
+        if (!availabilityCeiling.isAfter(row.scoringCutoff())) {
+            throw ApiException.badRequest("BACKFILL_CEILING_NOT_LATER",
+                    "batch backfill availability ceiling must be later than the case cutoff");
+        }
+        return enqueue(new RunCommand(row.id(), null, "CONTROLLED_BACKFILL", "BATCH_BACKFILL",
+                "LATEST_AVAILABLE", row.scoringCutoff(), availabilityCeiling, row.hazardDate(),
+                row.boundaryVersionId(), false, parentRunId, null, "batch-backfill", reason, null));
+    }
+
+    /**
+     * Terminate a queued or running shard because a targeted rollback disabled one of its
+     * definition dependencies. Already-finished runs are never rewritten.
+     */
+    @Transactional
+    public boolean terminateRun(long runId, String reason) {
+        int updated = db.jdbc().update("""
+                        update feature_run
+                           set status = 'TERMINATED', finished_at = now(),
+                               error_message = ?, notes = coalesce(notes, '') || ?
+                         where id = ? and status in ('QUEUED', 'RUNNING')
+                        """,
+                reason, " | terminated: " + reason, runId);
+        return updated > 0;
     }
 
     private long enqueue(RunCommand cmd) {
@@ -92,13 +136,13 @@ public class RunService {
                         insert into feature_run
                             (case_id, mode, trigger_type, status, verdict, data_policy, cutoff_at,
                              availability_ceiling, hazard_date, boundary_version_id, boundary_variant,
-                             parent_run_id, revision_event_id, reason, requested_by)
-                        values (?, ?, ?, 'QUEUED', 'NOT_EVALUATED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             parent_run_id, revision_event_id, reason, requested_by, shadow_run_id)
+                        values (?, ?, ?, 'QUEUED', 'NOT_EVALUATED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                 cmd.caseId(), cmd.mode(), cmd.trigger(), cmd.dataPolicy(),
                 Db.timestamp(cmd.cutoff()), Db.timestamp(cmd.ceiling()), cmd.hazardDate(),
                 cmd.boundaryVersionId(), cmd.boundaryVariant(), cmd.parentRunId(), cmd.revisionEventId(),
-                cmd.reason(), cmd.requestedBy());
+                cmd.reason(), cmd.requestedBy(), cmd.shadowRunId());
         return id;
     }
 
@@ -230,7 +274,7 @@ public class RunService {
                         Db.instant(rs, "requested_at"), Db.instant(rs, "started_at"),
                         Db.instant(rs, "finished_at"), rs.getString("error_message"),
                         (Long) rs.getObject("result_snapshot_id"), (Long) rs.getObject("result_candidate_id"),
-                        rs.getString("notes")),
+                        rs.getString("notes"), (Long) rs.getObject("shadow_run_id")),
                 runId);
         if (rows.isEmpty()) {
             throw ApiException.notFound("RUN_NOT_FOUND", "run not found: " + runId);
@@ -281,7 +325,7 @@ public class RunService {
     private record RunCommand(long caseId, Long ignored, String mode, String trigger, String dataPolicy,
                                Instant cutoff, Instant ceiling, LocalDate hazardDate, long boundaryVersionId,
                                boolean boundaryVariant, Long parentRunId, Long revisionEventId,
-                               String requestedBy, String reason) {
+                               String requestedBy, String reason, Long shadowRunId) {
     }
 
     public record RunRow(long id, Long caseId, String caseNo, String mode, String triggerType,
@@ -290,6 +334,6 @@ public class RunService {
                          boolean boundaryVariant, Long parentRunId, Long revisionEventId,
                          String reason, String requestedBy, Instant requestedAt, Instant startedAt,
                          Instant finishedAt, String error, Long resultSnapshotId, Long resultCandidateId,
-                         String notes) {
+                         String notes, Long shadowRunId) {
     }
 }

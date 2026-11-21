@@ -67,6 +67,16 @@ public class DemoController {
                        (select count(*) from review_candidate) as candidates,
                        (select count(*) from feature_run) as runs
                 """));
+        body.put("governanceDemos", List.of(
+                Map.of("endpoint", "POST /api/demo/governance/shadow",
+                        "proves", "shadow scoring over frozen snapshots; complete-chain over-threshold diffs "
+                                + "are BUSINESS_DIFFERENCE routed to the rule owner, never time-travel failures"),
+                Map.of("endpoint", "POST /api/demo/governance/gates",
+                        "proves", "release gates promote only threshold/temporal-passing versions and invalidate "
+                                + "themselves when the catalog changes during approval"),
+                Map.of("endpoint", "POST /api/demo/governance/rollback",
+                        "proves", "a targeted rollback terminates only the backfill shards reading the disabled "
+                                + "definition version while other versions' shards keep their results")));
         return body;
     }
 }

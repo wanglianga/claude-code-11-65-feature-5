@@ -43,6 +43,11 @@ app:
     worker-poll-interval-ms: ${APP_ORCH_POLL_MS:500}
     worker-enabled: ${APP_ORCH_WORKER_ENABLED:true}
     max-recompute-attempts: 3
+  governance:
+    default-score-diff-threshold: ${APP_GOV_SCORE_DIFF:0.15}
+    default-relative-diff-threshold: ${APP_GOV_REL_DIFF:0.20}
+    default-reversal-rate-limit: ${APP_GOV_REVERSAL_RATE:0.10}
+    relative-delta-floor: 0.05
 
 logging:
   level:

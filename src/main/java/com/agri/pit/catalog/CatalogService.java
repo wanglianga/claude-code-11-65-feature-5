@@ -6,6 +6,7 @@ import com.agri.pit.common.Times;
 import com.agri.pit.model.SourceType;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,9 +23,11 @@ import java.util.List;
 public class CatalogService {
 
     private final Db db;
+    private final ApplicationEventPublisher events;
 
-    public CatalogService(Db db) {
+    public CatalogService(Db db, ApplicationEventPublisher events) {
         this.db = db;
+        this.events = events;
     }
 
     @Transactional
@@ -67,6 +70,7 @@ public class CatalogService {
         }
         int lookback = req.lookbackDays() == null ? 0 : req.lookbackDays();
         long lag = req.availabilityLagSeconds() == null ? 0 : req.availabilityLagSeconds();
+        Instant effectiveAt = req.effectiveAt() == null ? Instant.now() : req.effectiveAt();
         Integer nextVersion = db.jdbc().queryForObject(
                 "select coalesce(max(version_no), 0) + 1 from feature_definition_version where feature_definition_id = ?",
                 Integer.class, feature.id());
@@ -75,14 +79,19 @@ public class CatalogService {
                 rs -> rs.next() ? rs.getLong(1) : null, feature.id());
         // Validate the formula eagerly by compiling it against the supported grammar.
         FormulaExpression.compile(formula);
-        return db.insert("""
+        long versionId = db.insert("""
                         insert into feature_definition_version
                             (feature_definition_id, version_no, formula, required, availability_lag_seconds,
-                             as_of_policy, lookback_days, status, checksum, notes, supersedes_version_id)
-                        values (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?)
+                             as_of_policy, lookback_days, status, checksum, notes, supersedes_version_id,
+                             effective_at)
+                        values (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)
                         """,
                 feature.id(), nextVersion, formula, req.required() == null || req.required(),
-                lag, asOfPolicy, lookback, checksum(formula), req.notes(), previousId);
+                lag, asOfPolicy, lookback, checksum(formula), req.notes(), previousId,
+                Db.timestamp(effectiveAt));
+        // A catalog mutation while gates are open must invalidate any approval in flight.
+        events.publishEvent(new CatalogChangedEvent(feature.id(), feature.code(), nextVersion));
+        return versionId;
     }
 
     @Transactional
@@ -134,7 +143,7 @@ public class CatalogService {
         List<CatalogDtos.VersionView> versions = db.jdbc().query("""
                         select fv.id, fd.code, fv.version_no, fv.formula, fv.required, fv.availability_lag_seconds,
                                fv.as_of_policy, fv.lookback_days, fv.status, fv.approved_by, fv.approved_at,
-                               fv.created_at, fv.checksum, fv.notes, fv.supersedes_version_id
+                               fv.created_at, fv.checksum, fv.notes, fv.supersedes_version_id, fv.effective_at
                           from feature_definition_version fv
                           join feature_definition fd on fd.id = fv.feature_definition_id
                          where fv.feature_definition_id = ?
@@ -148,6 +157,7 @@ public class CatalogService {
                         ts(rs.getObject("approved_at", OffsetDateTime.class)),
                         ts(rs.getObject("created_at", OffsetDateTime.class)),
                         rs.getString("checksum"), rs.getString("notes"),
+                        ts(rs.getObject("effective_at", OffsetDateTime.class)),
                         (Long) rs.getObject("supersedes_version_id")),
                 feature.id());
         CatalogDtos.FeatureSummary summary = new CatalogDtos.FeatureSummary(
@@ -179,7 +189,7 @@ public class CatalogService {
     public VersionRow requireVersion(long featureDefinitionId, int versionNo) {
         List<VersionRow> rows = db.jdbc().query("""
                         select id, feature_definition_id, version_no, formula, required, availability_lag_seconds,
-                               as_of_policy, lookback_days, status
+                               as_of_policy, lookback_days, status, effective_at
                           from feature_definition_version
                          where feature_definition_id = ? and version_no = ?
                         """,
@@ -187,13 +197,81 @@ public class CatalogService {
                         rs.getLong("id"), rs.getLong("feature_definition_id"), rs.getInt("version_no"),
                         rs.getString("formula"), rs.getBoolean("required"),
                         rs.getLong("availability_lag_seconds"), rs.getString("as_of_policy"),
-                        rs.getInt("lookback_days"), rs.getString("status")),
+                        rs.getInt("lookback_days"), rs.getString("status"),
+                        Db.instant(rs, "effective_at")),
                 featureDefinitionId, versionNo);
         if (rows.isEmpty()) {
             throw ApiException.notFound("VERSION_NOT_FOUND",
                     "feature version not found: definition " + featureDefinitionId + " v" + versionNo);
         }
         return rows.get(0);
+    }
+
+    /** Load any version row by its primary key (used by shadow runs and release gates). */
+    public VersionRow requireVersionById(long versionId) {
+        List<VersionRow> rows = db.jdbc().query("""
+                        select id, feature_definition_id, version_no, formula, required, availability_lag_seconds,
+                               as_of_policy, lookback_days, status, effective_at
+                          from feature_definition_version where id = ?
+                        """,
+                (rs, i) -> new VersionRow(
+                        rs.getLong("id"), rs.getLong("feature_definition_id"), rs.getInt("version_no"),
+                        rs.getString("formula"), rs.getBoolean("required"),
+                        rs.getLong("availability_lag_seconds"), rs.getString("as_of_policy"),
+                        rs.getInt("lookback_days"), rs.getString("status"),
+                        Db.instant(rs, "effective_at")),
+                versionId);
+        if (rows.isEmpty()) {
+            throw ApiException.notFound("VERSION_NOT_FOUND", "feature version not found: " + versionId);
+        }
+        return rows.get(0);
+    }
+
+    /**
+     * Stable fingerprint of the whole catalog. Release gates capture it at submission; the gate
+     * is invalidated whenever any definition or version row changes afterwards, so an approval can
+     * never promote a different artefact than the one that passed shadow scoring.
+     */
+    public String catalogFingerprint() {
+        List<String> rows = db.jdbc().queryForList("""
+                select coalesce(fd.code, '') || '|' || coalesce(fv.version_no::text, '') || '|'
+                       || coalesce(fv.checksum, '') || '|' || coalesce(fv.status, '') || '|'
+                       || coalesce(extract(epoch from fv.effective_at)::bigint::text, '') as line
+                  from feature_definition fd
+                  join feature_definition_version fv on fv.feature_definition_id = fd.id
+                 order by fd.code, fv.version_no
+                """, String.class);
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String line : rows) {
+                digest.update(line.getBytes(StandardCharsets.UTF_8));
+                digest.update((byte) '\n');
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Fingerprint covering only one definition's versions, for targeted change detection. */
+    public String definitionFingerprint(long featureDefinitionId) {
+        List<String> rows = db.jdbc().queryForList("""
+                select version_no::text || '|' || coalesce(checksum, '') || '|' || status || '|'
+                       || coalesce(extract(epoch from effective_at)::bigint::text, '') as line
+                  from feature_definition_version
+                 where feature_definition_id = ?
+                 order by version_no
+                """, String.class, featureDefinitionId);
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String line : rows) {
+                digest.update(line.getBytes(StandardCharsets.UTF_8));
+                digest.update((byte) '\n');
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     /** Snapshot of every currently approved definition version, used when a case is opened. */
@@ -240,7 +318,7 @@ public class CatalogService {
 
     public record VersionRow(long id, long featureDefinitionId, int versionNo, String formula,
                              boolean required, long availabilityLagSeconds, String asOfPolicy,
-                             int lookbackDays, String status) {
+                             int lookbackDays, String status, Instant effectiveAt) {
     }
 
     public record ApprovedFeature(String code, String name, String unit, List<String> sourceTypes,

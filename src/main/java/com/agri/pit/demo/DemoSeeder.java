@@ -41,6 +41,7 @@ public class DemoSeeder {
 
     public static final LocalDate HAZARD_DATE = LocalDate.of(2024, 6, 20);
     public static final Instant CASE_CUTOFF = Instant.parse("2024-06-22T00:00:00Z");
+    public static final Instant V1_EFFECTIVE = Instant.parse("2024-01-01T00:00:00Z");
     public static final String SCENE_LATE = "SCENE-2024-06-18-B";
     public static final String WEATHER_REVISION_KEY = "WS-001-W2024-06-13";
     public static final String CASE_PRIMARY = "DROUGHT-2024-0001";
@@ -74,6 +75,7 @@ public class DemoSeeder {
         }
         log.info("seeding drought demo scenario");
         seedCatalog();
+        seedGovernanceCandidates();
         long[] parcels = seedParcelsAndStations();
         long parcel1 = parcels[0];
         long parcel2 = parcels[1];
@@ -92,7 +94,7 @@ public class DemoSeeder {
                 List.of("SATELLITE_NDVI", "PARCEL_BOUNDARY")));
         catalog.createVersion("NDVI_DROUGHT", new CatalogDtos.CreateVersionRequest(
                 "clamp(1 - ndvi_mean + 0.25 * ndvi_range, 0, 1)", true, 0L, "AS_OF_CUTOFF", 30,
-                "v1: vegetation deficit with dispersion penalty"));
+                "v1: vegetation deficit with dispersion penalty", V1_EFFECTIVE));
         catalog.approve("NDVI_DROUGHT", 1, "catalog-admin", "initial drought index");
 
         catalog.createFeature(new CatalogDtos.CreateFeatureRequest("RAIN_ANOMALY", "Rainfall deficit",
@@ -100,7 +102,7 @@ public class DemoSeeder {
                 List.of("WEATHER_OBSERVATION")));
         catalog.createVersion("RAIN_ANOMALY", new CatalogDtos.CreateVersionRequest(
                 "max(0, 70 - rainfall_weighted * rainfall_periods)", true, 0L, "AS_OF_CUTOFF", 60,
-                "v1: rainfall shortfall vs a 70mm reference over the window"));
+                "v1: rainfall shortfall vs a 70mm reference over the window", V1_EFFECTIVE));
         catalog.approve("RAIN_ANOMALY", 1, "catalog-admin", "initial rainfall deficit");
 
         catalog.createFeature(new CatalogDtos.CreateFeatureRequest("CROP_EXPOSURE", "Crop exposure",
@@ -108,8 +110,45 @@ public class DemoSeeder {
                 List.of("PLANTING_DECLARATION")));
         catalog.createVersion("CROP_EXPOSURE", new CatalogDtos.CreateVersionRequest(
                 "declared_area_ha * clamp(days_since_planting / 120, 0.2, 1.5)", true, 0L,
-                "AS_OF_CUTOFF", 0, "v1: area scaled by growth stage"));
+                "AS_OF_CUTOFF", 0, "v1: area scaled by growth stage", V1_EFFECTIVE));
         catalog.approve("CROP_EXPOSURE", 1, "catalog-admin", "initial crop exposure");
+    }
+
+    /**
+     * Candidate DRAFT versions used by the governance demo. They deliberately cover every shadow
+     * classification without touching production scoring (drafts are never read by claim runs):
+     * <ul>
+     *   <li>NDVI_DROUGHT v2 — in force before the cutoff, materially different formula, complete
+     *       input chain: a BUSINESS_DIFFERENCE the rule owner must review;</li>
+     *   <li>NDVI_DROUGHT v3 — only effective after the case cutoff: a temporal-ordering
+     *       TIME_TRAVEL_FAILURE the release gate must block;</li>
+     *   <li>RAIN_ANOMALY v2 — near-identical formula, difference inside the threshold: a clean
+     *       gate that can be approved;</li>
+     *   <li>CROP_EXPOSURE v2 — references a variable the warehouse cannot supply: a
+     *       MISSING_DATA_DIFFERENCE driven by the missing-data policy.</li>
+     * </ul>
+     */
+    private void seedGovernanceCandidates() {
+        Instant inForceBeforeCutoff = Instant.parse("2024-02-01T00:00:00Z");
+        Instant effectiveAfterCutoff = Instant.parse("2024-07-01T00:00:00Z");
+
+        catalog.createVersion("NDVI_DROUGHT", new CatalogDtos.CreateVersionRequest(
+                "clamp(1.3 - ndvi_mean + 0.25 * ndvi_range, 0, 1)", true, 0L,
+                "AS_OF_CUTOFF", 30, "v2 draft: stronger drought weighting (business change)",
+                inForceBeforeCutoff));
+        catalog.createVersion("NDVI_DROUGHT", new CatalogDtos.CreateVersionRequest(
+                "clamp(1.4 - ndvi_mean, 0, 1)", true, 0L,
+                "AS_OF_CUTOFF", 30, "v3 draft: takes effect only after the case cutoff",
+                effectiveAfterCutoff));
+        catalog.createVersion("RAIN_ANOMALY", new CatalogDtos.CreateVersionRequest(
+                "max(0, 70 - rainfall_weighted * rainfall_periods) * 1.001", true, 0L,
+                "AS_OF_CUTOFF", 60, "v2 draft: negligible calibration nudge within threshold",
+                inForceBeforeCutoff));
+        catalog.createVersion("CROP_EXPOSURE", new CatalogDtos.CreateVersionRequest(
+                "declared_area_ha * clamp(days_since_planting / 120, 0.2, 1.5)"
+                        + " * coalesce(irrigation_factor, 1)", true, 0L,
+                "AS_OF_CUTOFF", 0, "v2 draft: depends on an irrigation factor not in the warehouse",
+                inForceBeforeCutoff));
     }
 
     // ------------------------------------------------------------- geo + assets

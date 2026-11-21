@@ -7,6 +7,7 @@ import com.agri.pit.catalog.CatalogService.ApprovedFeature;
 import com.agri.pit.common.ApiException;
 import com.agri.pit.common.Db;
 import com.agri.pit.common.Times;
+import com.agri.pit.governance.RollbackService;
 import com.agri.pit.leakage.AsOfSelector;
 import com.agri.pit.leakage.InputLedger;
 import com.agri.pit.leakage.LeakageDetector;
@@ -23,7 +24,9 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Executes a queued run. This is the "backfill orchestrator" as well as the original
@@ -47,9 +50,11 @@ public class RunExecutor {
     private final LeakageDetector detector;
     private final SnapshotService snapshots;
     private final RunService runService;
+    private final RollbackService rollbacks;
 
     public RunExecutor(Db db, CaseService cases, CatalogService catalog, AsOfSelector selector,
-                       LeakageDetector detector, SnapshotService snapshots, RunService runService) {
+                       LeakageDetector detector, SnapshotService snapshots, RunService runService,
+                       RollbackService rollbacks) {
         this.db = db;
         this.cases = cases;
         this.catalog = catalog;
@@ -57,6 +62,7 @@ public class RunExecutor {
         this.detector = detector;
         this.snapshots = snapshots;
         this.runService = runService;
+        this.rollbacks = rollbacks;
     }
 
     public record ClaimResult(long runId, String status, String verdict, Long snapshotId) {
@@ -84,6 +90,10 @@ public class RunExecutor {
                 return new ClaimResult(runId, run.status(), run.verdict(), run.resultSnapshotId());
             }
             db.jdbc().update("update feature_run set status = 'RUNNING', started_at = now() where id = ?", runId);
+        }
+        if ("TERMINATED".equals(run.status())) {
+            // A targeted rollback stopped this shard after it was claimed but before it executed.
+            return new ClaimResult(runId, run.status(), run.verdict(), run.resultSnapshotId());
         }
         CaseRow caseRow = cases.requireCase(run.caseNo());
         long boundaryVersionId = run.boundaryVersionId() != null
@@ -116,7 +126,7 @@ public class RunExecutor {
         FeatureEvaluator.Context context = FeatureEvaluator.buildContext(scenes, weather, declaration,
                 caseRow.hazardDate(), windowStart, windowEnd, boundary.areaHa());
 
-        List<ApprovedFeature> features = lockedFeatures(caseRow.id());
+        List<ApprovedFeature> features = resolveFeatures(caseRow, run, mode);
         List<FeatureEvaluator.FeatureResult> results = new ArrayList<>();
         boolean missingRequired = false;
         for (ApprovedFeature feature : features) {
@@ -167,7 +177,7 @@ public class RunExecutor {
                         """,
                 status, detection.verdict().name(), snapshotId, candidateId,
                 buildNote(detection, snapshotId, candidateId), runId);
-        if (status.equals("LEAKAGE_BLOCKED")) {
+        if (status.equals("LEAKAGE_BLOCKED") && mode != RunMode.SHADOW) {
             db.jdbc().update("""
                             update claim_case set status = 'UNDER_REVIEW'
                              where id = ? and status in ('OPEN','QUEUED','SCORED')
@@ -176,6 +186,51 @@ public class RunExecutor {
         log.info("run {} finished status={} verdict={} snapshot={} candidate={}", runId, status,
                 detection.verdict(), snapshotId, candidateId);
         return new ClaimResult(runId, status, detection.verdict().name(), snapshotId);
+    }
+
+    /**
+     * Resolve the definition versions a run must evaluate. Shadow runs swap in the candidate
+     * versions recorded in {@code shadow_run_definition}; every other run reads the case's locked
+     * versions except those disabled by an active targeted rollback.
+     */
+    private List<ApprovedFeature> resolveFeatures(CaseRow caseRow, RunService.RunRow run, RunMode mode) {
+        if (mode == RunMode.SHADOW && run.shadowRunId() != null) {
+            return shadowFeatures(caseRow.id(), run.shadowRunId());
+        }
+        List<ApprovedFeature> features = new ArrayList<>();
+        for (ApprovedFeature feature : lockedFeatures(caseRow.id())) {
+            if (!rollbacks.isReadEnabled(feature.versionId(), caseRow.id())) {
+                log.info("run {} skips feature {} v{}: definition version read disabled by rollback",
+                        run.id(), feature.code(), feature.versionNo());
+                continue;
+            }
+            features.add(feature);
+        }
+        return features;
+    }
+
+    private List<ApprovedFeature> shadowFeatures(long caseId, long shadowRunId) {
+        Map<String, Long> overrides = new HashMap<>();
+        db.jdbc().query("""
+                        select feature_code, definition_version_id
+                          from shadow_run_definition where shadow_run_id = ?
+                        """,
+                (rs, i) -> overrides.put(rs.getString("feature_code"), rs.getLong("definition_version_id")),
+                shadowRunId);
+        List<ApprovedFeature> resolved = new ArrayList<>();
+        for (ApprovedFeature feature : lockedFeatures(caseId)) {
+            Long overrideVersionId = overrides.get(feature.code());
+            if (overrideVersionId == null) {
+                resolved.add(feature);
+                continue;
+            }
+            CatalogService.VersionRow version = catalog.requireVersionById(overrideVersionId);
+            resolved.add(new ApprovedFeature(feature.code(), feature.name(), feature.unit(),
+                    feature.sourceTypes(), version.id(), version.versionNo(), version.formula(),
+                    version.required(), version.availabilityLagSeconds(), version.asOfPolicy(),
+                    version.lookbackDays()));
+        }
+        return resolved;
     }
 
     private String buildNote(LeakageDetector.Outcome detection, Long snapshotId, Long candidateId) {

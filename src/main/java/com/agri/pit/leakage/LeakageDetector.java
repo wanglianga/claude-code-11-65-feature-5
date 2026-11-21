@@ -80,8 +80,7 @@ public class LeakageDetector {
         }
 
         String summary = summarize(mode, cutoff, ceiling, eligible, excluded, hasMissingRequiredData,
-                ledger.blockReason());
-        long reportId = db.insert("""
+                ledger.blockReason());        long reportId = db.insert("""
                         insert into leakage_report
                             (run_id, verdict, cutoff_at, availability_ceiling, input_count, eligible_count,
                              excluded_count, blocked_count, summary)
@@ -110,6 +109,8 @@ public class LeakageDetector {
             case REPLAY -> "Replay verified as-of " + cutoff;
             case CONTROLLED_BACKFILL -> "Controlled backfill at ceiling " + ceiling
                     + "; result is a review candidate only";
+            case SHADOW -> "Shadow scoring verified as-of " + cutoff
+                    + "; no snapshot was written and the claim was not modified";
         };
         String tail = " (" + eligible + " eligible input(s)";
         if (excluded > 0) {

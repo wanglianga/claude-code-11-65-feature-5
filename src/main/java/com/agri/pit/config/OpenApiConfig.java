@@ -21,7 +21,9 @@ public class OpenApiConfig {
                         .version("1.0.0")
                         .description("""
                                 Feature catalog, point-in-time warehouse, backfill orchestrator, leakage detector,
-                                scoring snapshots, and revision impact analysis for drought claim verification.
+                                scoring snapshots, revision impact analysis, and a shadow-first release governance
+                                layer (shadow scoring, temporal ordering rules, reversal attribution, release gates
+                                and targeted rollbacks) for drought claim verification.
 
                                 **Two clocks.** Every warehouse record stores `observedAt` (when the phenomenon happened)
                                 and `ingestedAt` (when the platform could actually see it). Features are always selected
@@ -35,6 +37,14 @@ public class OpenApiConfig {
                                    shared pixels excluded instead of double counting them.
                                 3. A weather revision that arrives after settlement only creates a pending review
                                    candidate. The frozen snapshot and the settled payout are never rewritten.
+
+                                **Shadow-first release governance.** Candidate definition versions are scored twice over
+                                frozen case snapshots (mode SHADOW) without affecting production claims; over-threshold
+                                diffs on a complete input chain are BUSINESS_DIFFERENCE for rule-owner review while a
+                                broken temporal chain is a blocked TIME_TRAVEL_FAILURE. Release gates bind the approval to
+                                a catalog fingerprint and invalidate themselves on any catalog change, and targeted
+                                rollbacks disable reads of one definition version (optionally for specific cases),
+                                terminating only the backfill shards that depend on it.
                                 """)
                         .contact(new Contact().name("Claims platform"))
                         .license(new License().name("Proprietary")))

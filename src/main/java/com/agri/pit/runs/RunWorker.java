@@ -35,8 +35,13 @@ public class RunWorker {
             return;
         }
         for (int i = 0; i < 5; i++) {
+            // Shadow scoring and batch-backfill shards are driven synchronously by the governance
+            // services, which own their state transitions; the queue worker must not claim them.
             List<Long> runIds = db.jdbc().query("""
-                            select id from feature_run where status = 'QUEUED' order by requested_at, id limit 1
+                            select id from feature_run
+                             where status = 'QUEUED'
+                               and trigger_type not in ('SHADOW_SCORING', 'BATCH_BACKFILL')
+                             order by requested_at, id limit 1
                             """, (rs, row) -> rs.getLong(1));
             if (runIds.isEmpty()) {
                 return;

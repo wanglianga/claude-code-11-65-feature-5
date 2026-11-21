@@ -4,6 +4,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotEmpty;
 import jakarta.validation.constraints.PositiveOrZero;
 
+import java.time.Instant;
 import java.util.List;
 
 public final class CatalogDtos {
@@ -22,7 +23,14 @@ public final class CatalogDtos {
             @PositiveOrZero Long availabilityLagSeconds,
             String asOfPolicy,
             @PositiveOrZero Integer lookbackDays,
-            String notes) {
+            String notes,
+            Instant effectiveAt) {
+
+        /** Backwards-compatible constructor: the definition takes effect immediately. */
+        public CreateVersionRequest(String formula, Boolean required, Long availabilityLagSeconds,
+                                    String asOfPolicy, Integer lookbackDays, String notes) {
+            this(formula, required, availabilityLagSeconds, asOfPolicy, lookbackDays, notes, null);
+        }
     }
 
     public record ApproveVersionRequest(String approvedBy, String notes) {
@@ -54,6 +62,7 @@ public final class CatalogDtos {
             String createdAt,
             String checksum,
             String notes,
+            String effectiveAt,
             Long supersedesVersionId) {
     }
 
